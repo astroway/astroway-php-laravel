@@ -1,0 +1,390 @@
+name: Apply staged release
+
+# Internal release pipeline: walks _unreleased/v*/ in semver order, takes the
+# lowest pending version, validates its MANIFEST against npm + cadence, applies
+# declared files to public astroway/astroway-php, commits + tags as AstroWay
+# Team. The public publish workflow takes over on tag push and ships to npm
+# via OIDC trusted publishing. No issues are created in public; nothing leaks
+# from this private repo.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'    # daily 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force apply ignoring cadence threshold (still requires manifest validation)'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Run all checks but skip the actual push to public + npm'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # to remove _unreleased/ folder + commit on staging
+
+env:
+  PUBLIC_REPO: astroway/astroway-php
+  STAGING_TMP: /tmp/staging-snapshot
+  PUBLIC_TMP: /tmp/public
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout staging
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # ── 1. Find lowest pending _unreleased/vX.Y.Z/ ──────────────────
+      - name: Find next pending release
+        id: pending
+        run: |
+          set -euo pipefail
+          NEXT=$(ls -1d _unreleased/v*/ 2>/dev/null | sort -V | head -1 | sed 's|_unreleased/||; s|/||' || true)
+          if [ -z "$NEXT" ]; then
+            echo "::notice ::No pending releases in _unreleased/. Nothing to do."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Next pending: $NEXT"
+
+      # ── 2. Read + validate MANIFEST.json ────────────────────────────
+      - name: Read MANIFEST
+        if: steps.pending.outputs.skip != '1'
+        id: manifest
+        env:
+          NEXT_FOLDER: ${{ steps.pending.outputs.next }}
+        run: |
+          set -euo pipefail
+          F="_unreleased/${NEXT_FOLDER}/MANIFEST.json"
+          test -f "$F" || { echo "::error ::Missing MANIFEST.json"; exit 1; }
+
+          VERSION=$(jq -r .version "$F")
+          PREV=$(jq -r '.depends_on.previous_sdk_version' "$F")
+          TAG=$(jq -r .source.tag "$F")
+          TITLE=$(jq -r .title "$F")
+          TEST_CMD=$(jq -r '.checks.test_command' "$F")
+
+          # Folder name must match version field
+          if [ "v${VERSION}" != "${NEXT_FOLDER}" ]; then
+            echo "::error ::Folder/version mismatch: ${NEXT_FOLDER} vs v${VERSION}"
+            exit 1
+          fi
+
+          # Sanity-check version is plain semver — defense-in-depth against
+          # malformed manifest values reaching shell context downstream.
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'; then
+            echo "::error ::Invalid version format: $VERSION"; exit 1
+          fi
+          if ! echo "$TAG" | grep -qE '^[a-zA-Z0-9._/-]+$'; then
+            echo "::error ::Invalid tag format: $TAG"; exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prev=$PREV"       >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE"     >> "$GITHUB_OUTPUT"
+          {
+            echo "test_cmd<<TESTCMD_EOF"
+            echo "$TEST_CMD"
+            echo "TESTCMD_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Will apply v$VERSION ($TITLE)"
+
+      # ── 3. Verify the staging tag exists ────────────────────────────
+      - name: Verify staging tag exists
+        if: steps.pending.outputs.skip != '1'
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error ::Staging tag '$TAG' does not exist"
+            exit 1
+          fi
+
+      # ── 4. Public npm latest must match previous_sdk_version ────────
+      - name: Check npm latest matches previous_sdk_version
+        if: steps.pending.outputs.skip != '1'
+        id: prev_check
+        env:
+          EXPECTED_PREV: ${{ steps.manifest.outputs.prev }}
+        run: |
+          set -euo pipefail
+          # Bootstrap: when previous_sdk_version is null/empty, Packagist has nothing
+          # yet — skip the equality gate. Cadence step short-circuits below too.
+          if [ -z "$EXPECTED_PREV" ] || [ "$EXPECTED_PREV" = "null" ]; then
+            echo "::notice ::previous_sdk_version is null — bootstrap first release, skipping prev check."
+            echo "blocked=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          LATEST=$(curl -s "https://repo.packagist.org/p2/astroway/sdk.json" 2>/dev/null | jq -r ".packages.\"astroway/sdk\"[0].version // empty" | sed -E "s/^v//")
+          if [ -z "$LATEST" ]; then
+            echo "::warning ::Could not resolve Packagist latest version. Blocking."
+            echo "blocked=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$LATEST" != "$EXPECTED_PREV" ]; then
+            echo "::notice ::Packagist latest=$LATEST, manifest expects $EXPECTED_PREV. Blocking until prior versions ship."
+            echo "blocked=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice ::Packagist latest=$LATEST matches manifest prev. Continuing."
+            echo "blocked=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 5. Cadence threshold (nuanced for patches + force=true) ─────
+      - name: Cadence threshold check
+        if: steps.pending.outputs.skip != '1' && steps.prev_check.outputs.blocked != '1'
+        id: cadence
+        env:
+          PREV: ${{ steps.manifest.outputs.prev }}
+          VERSION: ${{ steps.manifest.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [ "$FORCE" = "true" ]; then
+            echo "::notice ::force=true — bypassing cadence gate"
+            echo "ready=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # Bootstrap first release — no prior to compare against.
+          if [ -z "$PREV" ] || [ "$PREV" = "null" ]; then
+            echo "::notice ::previous_sdk_version null — first release, bypassing cadence."
+            echo "ready=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # Patch policy:
+          #   - First patch after a minor (npm latest is X.Y.0) → bypass cadence,
+          #     ships next-day as a release-day hotfix. Looks deliberate.
+          #   - Subsequent patches (npm latest already X.Y.{>0}) → mini-cadence
+          #     of 2-4 days (deterministic per ISO week). Feels like active
+          #     maintenance, not burst-publishing.
+          # Minor/major fall through to the full 14-28d cadence below.
+          if echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[1-9][0-9]*$'; then
+            if echo "$PREV" | grep -qE '^[0-9]+\.[0-9]+\.0$'; then
+              echo "::notice ::v$VERSION is the first patch after minor v$PREV — bypassing cadence"
+              echo "ready=1" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+
+            # Subsequent patch: mini-cadence 2-4 days.
+            MODIFIED=$(curl -s "https://repo.packagist.org/p2/astroway/sdk.json" 2>/dev/null | jq -r --arg v "$PREV" '.packages."astroway/sdk"[] | select(.version == "v" + $v) | .time // empty')
+            if [ -z "$MODIFIED" ]; then
+              echo "::warning ::Cannot read npm publish time for $PREV. Continuing without patch-cadence gate."
+              echo "ready=1" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            MODIFIED_TS=$(date -d "$MODIFIED" +%s)
+            NOW_TS=$(date -u +%s)
+            DAYS=$(( (NOW_TS - MODIFIED_TS) / 86400 ))
+            WEEK=$(date -u +%G%V)
+            PATCH_THRESHOLD=$(( (10#${WEEK} * 7919) % 3 + 2 ))   # 2, 3, or 4 days
+            echo "Subsequent patch: $DAYS days since $PREV. Patch threshold this week: $PATCH_THRESHOLD."
+            if [ "$DAYS" -ge "$PATCH_THRESHOLD" ]; then
+              echo "ready=1" >> "$GITHUB_OUTPUT"
+            else
+              echo "::notice ::Patch cadence not met ($DAYS < $PATCH_THRESHOLD). Will retry tomorrow."
+              echo "ready=0" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          MODIFIED=$(curl -s "https://repo.packagist.org/p2/astroway/sdk.json" 2>/dev/null | jq -r --arg v "$PREV" '.packages."astroway/sdk"[] | select(.version == "v" + $v) | .time // empty')
+          if [ -z "$MODIFIED" ]; then
+            echo "::warning ::Cannot read npm publish time for $PREV. Continuing without cadence gate."
+            echo "ready=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          MODIFIED_TS=$(date -d "$MODIFIED" +%s)
+          NOW_TS=$(date -u +%s)
+          DAYS=$(( (NOW_TS - MODIFIED_TS) / 86400 ))
+          WEEK=$(date -u +%G%V)
+          THRESHOLD=$(( (10#${WEEK} * 7919) % 15 + 14 ))
+          echo "Last release ($PREV): $DAYS days ago. Threshold this week: $THRESHOLD."
+
+          if [ "$DAYS" -ge "$THRESHOLD" ]; then
+            echo "ready=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice ::Cadence not met ($DAYS < $THRESHOLD). Will retry tomorrow."
+            echo "ready=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 6. Snapshot staging tag (without leaving main checked out) ──
+      - name: Snapshot staging tag
+        if: steps.cadence.outputs.ready == '1'
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$STAGING_TMP"
+          # Extract files from tag without checking out (keeps main HEAD intact)
+          git archive --format=tar "$TAG" | tar -x -C "$STAGING_TMP"
+
+      # ── 7. Clone public repo with PAT, set AstroWay Team identity ───
+      - name: Clone public repo + set identity
+        if: steps.cadence.outputs.ready == '1'
+        env:
+          PUBLIC_REPO_PAT: ${{ secrets.PUBLIC_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${PUBLIC_REPO_PAT}@github.com/${PUBLIC_REPO}.git" "$PUBLIC_TMP"
+          cd "$PUBLIC_TMP"
+          git config user.email "astroway.info@gmail.com"
+          git config user.name  "AstroWay Team"
+
+          # ── ASSERTION: identity must be AstroWay Team ────────────────
+          ACTUAL_EMAIL=$(git config user.email)
+          ACTUAL_NAME=$(git config user.name)
+          if [ "$ACTUAL_EMAIL" != "astroway.info@gmail.com" ] || [ "$ACTUAL_NAME" != "AstroWay Team" ]; then
+            echo "::error ::Identity mismatch — got '$ACTUAL_NAME <$ACTUAL_EMAIL>', expected 'AstroWay Team <astroway.info@gmail.com>'"
+            exit 1
+          fi
+          echo "✓ Identity verified: $ACTUAL_NAME <$ACTUAL_EMAIL>"
+
+      # ── 8. Apply files[] from MANIFEST per `op` ─────────────────────
+      - name: Apply file changes
+        if: steps.cadence.outputs.ready == '1'
+        env:
+          NEXT_FOLDER: ${{ steps.pending.outputs.next }}
+        run: |
+          set -euo pipefail
+          MANIFEST="${GITHUB_WORKSPACE}/_unreleased/${NEXT_FOLDER}/MANIFEST.json"
+
+          jq -c '.files[]' "$MANIFEST" | while read -r entry; do
+            SRC=$(echo "$entry" | jq -r .src)
+            DEST=$(echo "$entry" | jq -r .dest)
+            OP=$(echo "$entry" | jq -r .op)
+
+            # Sanity: paths must not contain '..' or absolute prefix
+            for p in "$SRC" "$DEST"; do
+              case "$p" in
+                /*|*..*) echo "::error ::unsafe path: $p"; exit 1 ;;
+              esac
+            done
+
+            case "$OP" in
+              create)
+                if [ -e "$PUBLIC_TMP/$DEST" ]; then
+                  echo "::error ::create-collision — $DEST already exists in public"; exit 1
+                fi
+                test -f "$STAGING_TMP/$SRC" || { echo "::error ::missing src $SRC"; exit 1; }
+                mkdir -p "$(dirname "$PUBLIC_TMP/$DEST")"
+                cp "$STAGING_TMP/$SRC" "$PUBLIC_TMP/$DEST"
+                echo "  + create $DEST"
+                ;;
+              overwrite)
+                if [ ! -e "$PUBLIC_TMP/$DEST" ]; then
+                  echo "::error ::overwrite-missing — $DEST not in public"; exit 1
+                fi
+                test -f "$STAGING_TMP/$SRC" || { echo "::error ::missing src $SRC"; exit 1; }
+                cp "$STAGING_TMP/$SRC" "$PUBLIC_TMP/$DEST"
+                echo "  ~ overwrite $DEST"
+                ;;
+              delete)
+                if [ -e "$PUBLIC_TMP/$DEST" ]; then
+                  rm -f "$PUBLIC_TMP/$DEST"
+                  echo "  - delete $DEST"
+                fi
+                ;;
+              *)
+                echo "::error ::unknown op $OP"; exit 1
+                ;;
+            esac
+          done
+
+      # ── 9. Apply package_json_patch (deep merge) ────────────────────
+      - name: Apply package.json patch
+        if: steps.cadence.outputs.ready == '1'
+        env:
+          NEXT_FOLDER: ${{ steps.pending.outputs.next }}
+        run: |
+          set -euo pipefail
+          MANIFEST="${GITHUB_WORKSPACE}/_unreleased/${NEXT_FOLDER}/MANIFEST.json"
+          PATCH=$(jq -c '.package_json_patch // {}' "$MANIFEST")
+          if [ "$PATCH" = "{}" ]; then
+            echo "No package_json_patch declared, skipping."
+            exit 0
+          fi
+          cd "$PUBLIC_TMP"
+          jq --argjson patch "$PATCH" '. * $patch' package.json > package.json.new
+          mv package.json.new package.json
+          echo "✓ package.json patched"
+          jq '{name, version, dependencies, devDependencies}' package.json
+
+      # ── 10. Run checks (test + build) ────────────────────────────────
+      - name: Run release checks
+        if: steps.cadence.outputs.ready == '1'
+        env:
+          TEST_CMD: ${{ steps.manifest.outputs.test_cmd }}
+        run: |
+          set -euo pipefail
+          cd "$PUBLIC_TMP"
+          # Defense in depth: test_cmd comes from manifest in our private repo
+          # (so trusted), but we still run it via bash -c with explicit PATH.
+          bash -c "$TEST_CMD"
+
+      # ── 11. Commit + tag + push to public ────────────────────────────
+      - name: Commit, tag, push to public
+        if: steps.cadence.outputs.ready == '1' && inputs.dry_run != true
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$PUBLIC_TMP"
+
+          # Re-assert identity right before commit (defense in depth)
+          if [ "$(git config user.email)" != "astroway.info@gmail.com" ] || [ "$(git config user.name)" != "AstroWay Team" ]; then
+            echo "::error ::Identity drift before commit"; exit 1
+          fi
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::warning ::No changes to commit. Skipping push."
+            exit 0
+          fi
+
+          # Neutral message (per public-hygiene rules)
+          git commit -m "release: v${VERSION}"
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+
+          git push origin main
+          git push origin "v${VERSION}"
+
+          echo "✓ Pushed to public. publish-mcp.yml will fire on tag and ship to npm."
+
+      # ── 12. Remove _unreleased/vX.Y.Z/ in staging ───────────────────
+      - name: Cleanup staging queue
+        if: steps.cadence.outputs.ready == '1' && inputs.dry_run != true
+        env:
+          NEXT_FOLDER: ${{ steps.pending.outputs.next }}
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          rm -rf "_unreleased/${NEXT_FOLDER}"
+
+          git config user.email "astroway.info@gmail.com"
+          git config user.name  "AstroWay Team"
+          if [ "$(git config user.email)" != "astroway.info@gmail.com" ]; then
+            echo "::error ::Identity wrong on staging commit"; exit 1
+          fi
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit in staging."; exit 0
+          fi
+          git commit -m "release-queue: ship ${NEXT_FOLDER}"
+          git push origin main
+
+      # ── 13. Dry-run summary ─────────────────────────────────────────
+      - name: Dry run summary
+        if: steps.cadence.outputs.ready == '1' && inputs.dry_run == true
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          echo "::notice ::DRY RUN — would have shipped v${VERSION} to public + npm."
+          echo "Skipped: git push to public, npm publish trigger, _unreleased/ cleanup."
