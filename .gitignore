@@ -3,3 +3,9 @@ composer.lock
 .phpunit.result.cache
 *.log
 .DS_Store
+
+# Internal release planning stays in the staging repo, never in the public artifact.
+ROADMAP.md
+docs/
+handoff*
+_unreleased/
